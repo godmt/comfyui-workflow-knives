@@ -78,8 +78,44 @@ _load_dotenv_if_available()
 # Helpers
 # -----------------------------------------------------------------------------
 
-def _normalize_chat_completions_url(api_base_url: str) -> str:
-    """Accept either a base URL or a full /chat/completions endpoint."""
+class HttpJsonError(RuntimeError):
+    """HTTP error that preserves status code and response body for safe fallback."""
+
+    def __init__(self, status_code: int, body: str, url: str):
+        self.status_code = int(status_code)
+        self.body = body
+        self.url = url
+        super().__init__(f"HTTP {status_code} from LLM server: {body}")
+
+
+def _join_url(base: str, suffix: str) -> str:
+    return base.rstrip("/") + suffix
+
+
+def _chat_completions_sibling_url(endpoint_url: str) -> str:
+    """Return the sibling /chat/completions endpoint for a /responses URL."""
+    url = (endpoint_url or "").strip().rstrip("/")
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/responses"):
+        new_path = path[: -len("/responses")] + "/chat/completions"
+        return urllib.parse.urlunparse(parsed._replace(path=new_path))
+    return _resolve_api_endpoint(url)[1]
+
+
+def _resolve_api_endpoint(api_base_url: str) -> Tuple[str, str, Optional[str]]:
+    """
+    Resolve api_base_url into (mode, endpoint, fallback_endpoint).
+
+    Modes:
+      chat       -> send Chat Completions payload to /chat/completions
+      responses  -> send Responses payload to /responses, with chat fallback on endpoint-not-supported errors
+
+    Supported URL forms:
+      .../v1                    -> chat, appends /chat/completions
+      .../v1/chat/completions   -> chat
+      .../v1/responses          -> responses, fallback sibling is .../v1/chat/completions
+    """
     url = (api_base_url or "").strip()
     if not url:
         raise ValueError("api_base_url is empty")
@@ -88,17 +124,32 @@ def _normalize_chat_completions_url(api_base_url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     path = parsed.path.rstrip("/")
 
+    if path.endswith("/responses"):
+        return "responses", url, _chat_completions_sibling_url(url)
+
     if path.endswith("/chat/completions"):
-        return url
+        return "chat", url, None
 
     if path == "" or path == "/":
-        suffix = "/v1/chat/completions"
-    elif path.endswith("/v1"):
-        suffix = "/chat/completions"
-    else:
-        suffix = "/chat/completions"
+        return "chat", _join_url(url, "/v1/chat/completions"), None
 
-    return url + suffix
+    if path.endswith("/v1"):
+        return "chat", _join_url(url, "/chat/completions"), None
+
+    # Preserve the old forgiving behavior for custom base paths.
+    return "chat", _join_url(url, "/chat/completions"), None
+
+
+def _is_responses_endpoint_not_supported_error(error: Exception) -> bool:
+    """Only fallback when the endpoint itself appears unsupported, not for auth/model/schema errors."""
+    if not isinstance(error, HttpJsonError):
+        return False
+    if error.status_code in (404, 405, 501):
+        return True
+    body = (error.body or "").lower()
+    return error.status_code == 400 and (
+        "responses" in body and any(token in body for token in ("not found", "unsupported", "unknown endpoint", "unknown route"))
+    )
 
 
 def _parse_json_object(value: str, field_name: str) -> Dict[str, Any]:
@@ -192,6 +243,146 @@ def _build_user_content(user_prompt: str, image: Any, image_detail: str, image_m
 
     return content
 
+def _build_responses_input(user_prompt: str, image: Any, image_detail: str, image_max_count: int) -> Any:
+    """Build OpenAI Responses-style input. Uses input_text/input_image content parts."""
+    if image is None:
+        return user_prompt
+
+    content: List[Dict[str, Any]] = [{"type": "input_text", "text": user_prompt}]
+    detail = (image_detail or "auto").strip()
+
+    for data_url in _image_tensor_to_data_urls(image, image_max_count):
+        item: Dict[str, Any] = {"type": "input_image", "image_url": data_url}
+        if detail != "omit":
+            item["detail"] = detail
+        content.append(item)
+
+    return [{"role": "user", "content": content}]
+
+
+def _apply_token_limit(body: Dict[str, Any], max_tokens: int, max_tokens_field: str, api_mode: str) -> None:
+    value = int(max_tokens)
+    if api_mode == "responses":
+        # Responses API uses max_output_tokens. Keep the UI field name generic; extra_body_json can override.
+        body["max_output_tokens"] = value
+        return
+
+    if max_tokens_field == "max_completion_tokens":
+        body["max_completion_tokens"] = value
+    elif max_tokens_field == "both":
+        body["max_tokens"] = value
+        body["max_completion_tokens"] = value
+    else:
+        body["max_tokens"] = value
+
+
+def _build_chat_body(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    max_tokens_field: str,
+    thinking: str,
+    thinking_api_style: str,
+    image: Any,
+    image_detail: str,
+    image_max_count: int,
+    seed: int,
+    presence_penalty: float,
+    frequency_penalty: float,
+    stop: str,
+    json_mode: str,
+    extra_body_json: str,
+) -> Dict[str, Any]:
+    messages: List[Dict[str, Any]] = []
+    if (system_prompt or "").strip():
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append(
+        {
+            "role": "user",
+            "content": _build_user_content(user_prompt, image, image_detail, image_max_count),
+        }
+    )
+
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "stream": False,
+    }
+
+    _apply_token_limit(body, max_tokens, max_tokens_field, "chat")
+
+    if presence_penalty != 0.0:
+        body["presence_penalty"] = float(presence_penalty)
+    if frequency_penalty != 0.0:
+        body["frequency_penalty"] = float(frequency_penalty)
+    if seed is not None and int(seed) >= 0:
+        body["seed"] = int(seed)
+
+    stop_values = _parse_stop(stop)
+    if stop_values:
+        body["stop"] = stop_values
+
+    if json_mode == "json_object":
+        body["response_format"] = {"type": "json_object"}
+
+    _apply_thinking_params(body, thinking, thinking_api_style)
+    body.update(_parse_json_object(extra_body_json, "extra_body_json"))
+    return body
+
+
+def _build_responses_body(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    max_tokens_field: str,
+    thinking: str,
+    thinking_api_style: str,
+    image: Any,
+    image_detail: str,
+    image_max_count: int,
+    seed: int,
+    presence_penalty: float,
+    frequency_penalty: float,
+    json_mode: str,
+    extra_body_json: str,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "model": model,
+        "input": _build_responses_input(user_prompt, image, image_detail, image_max_count),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "stream": False,
+    }
+
+    if (system_prompt or "").strip():
+        body["instructions"] = system_prompt
+
+    _apply_token_limit(body, max_tokens, max_tokens_field, "responses")
+
+    if presence_penalty != 0.0:
+        body["presence_penalty"] = float(presence_penalty)
+    if frequency_penalty != 0.0:
+        body["frequency_penalty"] = float(frequency_penalty)
+    if seed is not None and int(seed) >= 0:
+        body["seed"] = int(seed)
+
+    if json_mode == "json_object":
+        # OpenAI Responses-style JSON mode. Provider-specific alternatives can be set via extra_body_json.
+        body["text"] = {"format": {"type": "json_object"}}
+
+    _apply_thinking_params(body, thinking, thinking_api_style)
+    body.update(_parse_json_object(extra_body_json, "extra_body_json"))
+    return body
+
+
 
 def _extract_message_text(message: Any) -> str:
     if message is None:
@@ -233,6 +424,86 @@ def _extract_reasoning_text(choice: Dict[str, Any]) -> str:
         if isinstance(value, dict):
             return json.dumps(value, ensure_ascii=False, indent=2)
     return ""
+
+def _extract_responses_text(response: Dict[str, Any]) -> str:
+    """Extract the main text from a Responses API-like payload."""
+    value = response.get("output_text")
+    if isinstance(value, str):
+        return value
+
+    parts: List[str] = []
+    output = response.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("text"), str) and item.get("type") in ("output_text", "text"):
+                parts.append(item["text"])
+            content = item.get("content")
+            if isinstance(content, list):
+                for c in content:
+                    if not isinstance(c, dict):
+                        continue
+                    if isinstance(c.get("text"), str) and c.get("type") in ("output_text", "text", None):
+                        parts.append(c["text"])
+                    elif isinstance(c.get("content"), str):
+                        parts.append(c["content"])
+
+    if parts:
+        return "\n".join(parts)
+
+    return _extract_message_text(response.get("message") or response.get("response") or response)
+
+
+def _extract_responses_reasoning_text(response: Dict[str, Any]) -> str:
+    """Extract reasoning/thinking snippets from a Responses API-like payload when present."""
+    candidates = [response.get("reasoning"), response.get("thinking"), response.get("reasoning_content")]
+    output = response.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in ("reasoning", "thinking"):
+                candidates.append(item)
+            for key in ("reasoning", "thinking", "summary"):
+                if key in item:
+                    candidates.append(item.get(key))
+            content = item.get("content")
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") in ("reasoning", "thinking", "summary_text"):
+                        candidates.append(c)
+
+    parts: List[str] = []
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+        elif isinstance(value, dict):
+            text = value.get("text") or value.get("summary") or value.get("content")
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+            elif value:
+                parts.append(json.dumps(value, ensure_ascii=False, indent=2))
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("summary") or item.get("content")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text)
+
+    return "\n".join(parts)
+
+
+def _extract_chat_text_and_reasoning(response: Dict[str, Any]) -> Tuple[str, str]:
+    choices = response.get("choices") or []
+    if not choices:
+        text = _extract_message_text(response.get("message") or response.get("response") or response)
+        return text, ""
+    choice0 = choices[0]
+    return _extract_message_text(choice0.get("message")), _extract_reasoning_text(choice0)
 
 
 def _apply_thinking_params(body: Dict[str, Any], thinking: str, thinking_api_style: str) -> None:
@@ -345,7 +616,7 @@ def _get_json(url: str, headers: Dict[str, str], timeout_sec: int) -> Dict[str, 
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code} from LLM server: {err_body}") from e
+        raise HttpJsonError(e.code, err_body, url) from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Failed to connect to LLM server: {e}") from e
 
@@ -458,7 +729,7 @@ def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str], timeout_
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code} from LLM server: {err_body}") from e
+        raise HttpJsonError(e.code, err_body, url) from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Failed to connect to LLM server: {e}") from e
 
@@ -473,7 +744,7 @@ def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str], timeout_
 # -----------------------------------------------------------------------------
 
 class OpenAICompatibleLLM:
-    """Call an OpenAI-compatible /v1/chat/completions server and return text."""
+    """Call an OpenAI-compatible /v1/chat/completions or /v1/responses server and return text."""
 
     CATEGORY = "LLM/OpenAI Compatible"
     FUNCTION = "run"
@@ -482,11 +753,11 @@ class OpenAICompatibleLLM:
     OUTPUT_TOOLTIPS = (
         "The assistant's main text response extracted from the first choice.",
         "Reasoning/thinking text if the provider returns it separately; otherwise empty.",
-        "The full JSON response from the chat completions endpoint.",
+        "The full JSON response from the selected endpoint: Chat Completions or Responses.",
         "The usage object from the response, such as token counts, when provided.",
         "Provider-specific unload result or warning. Empty JSON when unload_after_call is off.",
     )
-    DESCRIPTION = "Minimal OpenAI-compatible Chat Completions caller with optional IMAGE input and optional LM Studio/Ollama unload."
+    DESCRIPTION = "Minimal OpenAI-compatible Chat Completions/Responses caller with optional IMAGE input and optional LM Studio/Ollama unload."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -497,7 +768,7 @@ class OpenAICompatibleLLM:
                     {
                         "default": "https://api.openai.com/v1",
                         "multiline": False,
-                        "tooltip": "Base URL or full /chat/completions endpoint. Examples: https://api.openai.com/v1, http://127.0.0.1:1234/v1, http://127.0.0.1:11434/v1.",
+                        "tooltip": "Base URL or full endpoint. Use /v1 for the default Chat Completions endpoint. Use /v1/chat/completions to force Chat Completions. Use /v1/responses to try the newer Responses API; if that endpoint is not supported, this node falls back to the sibling /chat/completions endpoint.",
                     },
                 ),
                 "api_key_env": (
@@ -556,7 +827,7 @@ class OpenAICompatibleLLM:
                     "INT",
                     {
                         "default": 1024,
-                        "min": 1,
+                        "min": 64,
                         "max": 262144,
                         "step": 64,
                         "tooltip": "Maximum number of tokens to generate. Some reasoning-capable servers may count hidden reasoning tokens against this budget.",
@@ -566,7 +837,7 @@ class OpenAICompatibleLLM:
                     ["max_tokens", "max_completion_tokens", "both"],
                     {
                         "default": "max_tokens",
-                        "tooltip": "Which token-limit field to send. max_tokens is most compatible; max_completion_tokens is newer OpenAI style; both is only for servers that accept both.",
+                        "tooltip": "Which token-limit field to send for Chat Completions. Responses API URLs use max_output_tokens automatically; extra_body_json can override provider-specific details.",
                     },
                 ),
                 "thinking": (
@@ -657,7 +928,7 @@ class OpenAICompatibleLLM:
                     ["off", "json_object"],
                     {
                         "default": "off",
-                        "tooltip": "When json_object is selected, sends response_format={type: json_object}. The prompt should still explicitly ask for JSON.",
+                        "tooltip": "Ask the API for JSON-object output. Chat Completions sends response_format; Responses sends text.format. The prompt should still explicitly ask for JSON.",
                     },
                 ),
                 "extra_body_json": (
@@ -732,68 +1003,85 @@ class OpenAICompatibleLLM:
         unload_provider: str = "auto",
         timeout_sec: int = 120,
     ) -> Tuple[str, str, str, str, str]:
-        endpoint = _normalize_chat_completions_url(api_base_url)
-
-        messages: List[Dict[str, Any]] = []
-        if (system_prompt or "").strip():
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append(
-            {
-                "role": "user",
-                "content": _build_user_content(user_prompt, image, image_detail, image_max_count),
-            }
-        )
-
-        body: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": float(temperature),
-            "top_p": float(top_p),
-            "stream": False,
-        }
-
-        if max_tokens_field == "max_completion_tokens":
-            body["max_completion_tokens"] = int(max_tokens)
-        elif max_tokens_field == "both":
-            body["max_tokens"] = int(max_tokens)
-            body["max_completion_tokens"] = int(max_tokens)
-        else:
-            body["max_tokens"] = int(max_tokens)
-
-        if presence_penalty != 0.0:
-            body["presence_penalty"] = float(presence_penalty)
-        if frequency_penalty != 0.0:
-            body["frequency_penalty"] = float(frequency_penalty)
-        if seed is not None and int(seed) >= 0:
-            body["seed"] = int(seed)
-
-        stop_values = _parse_stop(stop)
-        if stop_values:
-            body["stop"] = stop_values
-
-        if json_mode == "json_object":
-            body["response_format"] = {"type": "json_object"}
-
-        _apply_thinking_params(body, thinking, thinking_api_style)
-
-        # User-specified extra body wins, so advanced provider knobs can override defaults.
-        body.update(_parse_json_object(extra_body_json, "extra_body_json"))
-
+        api_mode, endpoint, chat_fallback_endpoint = _resolve_api_endpoint(api_base_url)
         headers = _build_common_headers(api_key_env, extra_headers_json)
 
-        response = _post_json(endpoint, body, headers, int(timeout_sec))
-        raw_json = json.dumps(response, ensure_ascii=False, indent=2)
-
-        choices = response.get("choices") or []
-        if not choices:
-            # Some servers may return {message:{...}} or {response:"..."}; handle gently.
-            text = _extract_message_text(response.get("message") or response.get("response") or response)
-            reasoning_text = ""
+        if api_mode == "responses":
+            body = _build_responses_body(
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                max_tokens_field=max_tokens_field,
+                thinking=thinking,
+                thinking_api_style=thinking_api_style,
+                image=image,
+                image_detail=image_detail,
+                image_max_count=image_max_count,
+                seed=seed,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                json_mode=json_mode,
+                extra_body_json=extra_body_json,
+            )
+            try:
+                response = _post_json(endpoint, body, headers, int(timeout_sec))
+                text = _extract_responses_text(response)
+                reasoning_text = _extract_responses_reasoning_text(response)
+            except Exception as e:
+                if not (chat_fallback_endpoint and _is_responses_endpoint_not_supported_error(e)):
+                    raise
+                # Fallback only when the /responses endpoint itself appears unsupported.
+                # Auth failures, model errors, and ordinary schema errors are surfaced instead.
+                chat_body = _build_chat_body(
+                    model=model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    max_tokens_field=max_tokens_field,
+                    thinking=thinking,
+                    thinking_api_style=thinking_api_style,
+                    image=image,
+                    image_detail=image_detail,
+                    image_max_count=image_max_count,
+                    seed=seed,
+                    presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty,
+                    stop=stop,
+                    json_mode=json_mode,
+                    extra_body_json=extra_body_json,
+                )
+                response = _post_json(chat_fallback_endpoint, chat_body, headers, int(timeout_sec))
+                text, reasoning_text = _extract_chat_text_and_reasoning(response)
         else:
-            choice0 = choices[0]
-            text = _extract_message_text(choice0.get("message"))
-            reasoning_text = _extract_reasoning_text(choice0)
+            body = _build_chat_body(
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                max_tokens_field=max_tokens_field,
+                thinking=thinking,
+                thinking_api_style=thinking_api_style,
+                image=image,
+                image_detail=image_detail,
+                image_max_count=image_max_count,
+                seed=seed,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                stop=stop,
+                json_mode=json_mode,
+                extra_body_json=extra_body_json,
+            )
+            response = _post_json(endpoint, body, headers, int(timeout_sec))
+            text, reasoning_text = _extract_chat_text_and_reasoning(response)
 
+        raw_json = json.dumps(response, ensure_ascii=False, indent=2)
         usage_json = json.dumps(response.get("usage", {}), ensure_ascii=False, indent=2)
 
         unload_json = "{}"
